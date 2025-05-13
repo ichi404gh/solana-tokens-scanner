@@ -1,16 +1,30 @@
-# This is a sample Python script.
+import asyncio
+import signal
 
-# Press Shift+F10 to execute it or replace it with your code.
-# Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
+from solana.rpc.websocket_api import connect
 
+shutdown_event = asyncio.Event()
 
-def print_hi(name):
-    # Use a breakpoint in the code line below to debug your script.
-    print(f'Hi, {name}')  # Press Ctrl+F8 to toggle the breakpoint.
+def ask_exit(*args):
+    print("got signal: exit")
+    print(args)
+    shutdown_event.set()
+    print("Stopping loop...")
 
+async def main():
+    async with connect("wss://api.devnet.solana.com") as websocket:
+        await websocket.logs_subscribe()
+        print("Subscribed")
+        first_resp = await websocket.recv()
+        subscription_id = first_resp[0].result
+        while not shutdown_event.is_set():
+            next_resp = await websocket.recv()
+            print(next_resp)
 
-# Press the green button in the gutter to run the script.
+        await websocket.logs_unsubscribe(subscription_id)
+        print("Unsubscribed")
+
 if __name__ == '__main__':
-    print_hi('PyCharm')
-
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
+    signal.signal(signal.SIGINT, ask_exit)
+    signal.signal(signal.SIGTERM, ask_exit)
+    asyncio.run(main())
