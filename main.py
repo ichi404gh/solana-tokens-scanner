@@ -3,59 +3,21 @@ import datetime
 import os
 import signal
 import logging
-from dataclasses import dataclass
 
 import dotenv
 from solana.rpc import commitment
 from solana.rpc.websocket_api import connect
 from solana.rpc.api import Client
-from solders.solders import Pubkey, RpcTransactionLogsFilterMentions, Signature
+from solders.solders import Pubkey, RpcTransactionLogsFilterMentions
 
-from metadata import MetadataProcessor
+from config import CONFIG
+from metadata_processor import MetadataProcessor
+from token_processor import TokenExtractionProcessor
+from log import logger
+from utils import keep_alive
 
-"""
-TODO:
-+ extract tokens from tx
-+ get token names
-    - handle in pairs
-    - report, filter required patterns
-- error handling
-- loop break
-+ add logging
-"""
-
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', )
-logger = logging.getLogger("main")
-logger.setLevel(logging.DEBUG)
 
 shutdown_event = asyncio.Event()
-
-
-@dataclass
-class AMMConfig:
-    program_id: str
-    token_mint_0_idx: int
-    token_mint_1_idx: int
-    log_pattern: str
-
-
-CONFIGS = {
-    'orca': AMMConfig(
-        program_id="whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
-        token_mint_0_idx=1,
-        token_mint_1_idx=2,
-        log_pattern='Instruction: InitializePool'
-    ),
-    'raydium_CAMM': AMMConfig(
-        program_id="CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
-        token_mint_0_idx=3,
-        token_mint_1_idx=4,
-        log_pattern='Program log: Instruction: CreatePool'
-    ),
-}
-
-CONFIG = CONFIGS['raydium_CAMM']
-
 
 def ask_exit(*args):
     signal_map = {signal.SIGINT: 'SIGINT', signal.SIGTERM: 'SIGTERM'}
@@ -67,14 +29,20 @@ def ask_exit(*args):
 
 async def main():
     try:
-        dotenv.load_dotenv()
-        mp = MetadataProcessor()
+        c = Client(os.environ.get('RPC_ENDPOINT'))
+
+        tokens_queue = asyncio.Queue()
+
+        tp = TokenExtractionProcessor(client=c, result_queue=tokens_queue, shutdown_event=shutdown_event)
+        tp.run()
+
+        mp = MetadataProcessor(job_queue=tokens_queue, shutdown_event=shutdown_event)
         mp.run()
 
-        c = Client('https://api.mainnet-beta.solana.com')
         count = 0
 
         async with connect(os.environ.get('WS_ENDPOINT')) as websocket:
+            keep_alive_task = asyncio.create_task(keep_alive(websocket))
             try:
                 await websocket.logs_subscribe(
                     filter_=RpcTransactionLogsFilterMentions(
@@ -93,16 +61,13 @@ async def main():
                         logger.debug(f"Processed {count} transactions")
 
                     try:
-                        next_resp = await asyncio.wait_for(websocket.recv(), timeout=2)
+                        next_resp = await websocket.recv()
                         for resp in next_resp:
                             count += 1
                             log_lines = resp.result.value.logs
                             for line in log_lines:
                                 if CONFIG.log_pattern in line:
-                                    await process_log_response(resp, c, mp)
-
-                    except asyncio.TimeoutError:
-                        continue
+                                    await process_log_response(resp, tp)
                     except asyncio.exceptions.IncompleteReadError:
                         logger.error("Connection was interrupted. Attempting to reconnect...")
                         break
@@ -116,6 +81,8 @@ async def main():
                     await websocket.logs_unsubscribe(subscription_id)
                     await websocket.recv()
                 logger.info("Successfully unsubscribed from WebSocket")
+                keep_alive_task.cancel()
+
 
     finally:
         # Cancel all running tasks
@@ -127,27 +94,9 @@ async def main():
                            return_exceptions=True)
 
 
-def get_tokens_from_pool_tx(client: Client, tx_hash: Signature):
-    tx = client.get_transaction(tx_hash, max_supported_transaction_version=0, commitment=commitment.Confirmed,
-                              encoding="jsonParsed")
-    logger.debug(tx)
-    instructions = tx.value.transaction.transaction.message.instructions
-
-    for ix in instructions:
-        if ix.program_id == Pubkey.from_string(CONFIG.program_id):
-            return ix.accounts[CONFIG.token_mint_0_idx], ix.accounts[CONFIG.token_mint_1_idx]  # from IDL
-
-
-async def process_log_response(resp, client: Client, mp: MetadataProcessor):
+async def process_log_response(resp, tp: TokenExtractionProcessor):
     logger.debug("Processing transaction " + str(resp.result.value.signature))
-    with open('results.txt', 'a') as f:
-        f.write(datetime.datetime.now().isoformat() + ' - ')
-        f.write(str(resp.result.value.signature) + '\n')
-    with open('logs.txt', 'a') as f:
-        f.write(str(resp) + '\n')
-
-    tokens = get_tokens_from_pool_tx(client, resp.result.value.signature)
-    await mp.enqueue_metadata_job(tokens)
+    await tp.enqueue_token_job(resp.result.value.signature)
 
 
 if __name__ == '__main__':
