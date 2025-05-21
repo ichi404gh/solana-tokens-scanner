@@ -35,6 +35,10 @@ A Python application that monitors Solana blockchain transactions for specific A
    ```sh
    pip install -r requirements.txt
    ```
+4. Run
+   ```sh
+   python main.py
+   ```
 
 ## Environment Variables
 
